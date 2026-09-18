@@ -822,7 +822,7 @@ BEGIN
 END;$FUNCTION$
 LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION Getstorage_domains_By_connection (v_connection VARCHAR)
+CREATE OR REPLACE FUNCTION Getstorage_domains_By_connection (v_connection VARCHAR(250))
 RETURNS SETOF storage_domains STABLE AS $FUNCTION$
 BEGIN
     RETURN QUERY
