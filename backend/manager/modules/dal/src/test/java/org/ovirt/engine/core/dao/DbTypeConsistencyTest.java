@@ -27,18 +27,12 @@ import org.springframework.jdbc.core.JdbcTemplate;
 /**
  * Guards against inconsistencies between the parameters that are used in
  * stored procedures and the columns of the tables they reference, including
- * length/precision modifiers (a {@code varchar(100)} parameter against a
- * {@code varchar(255)} column is a mismatch).
- *
- * Parameter declarations are parsed from the source files under
- * {@code packaging/dbscripts/*_sp.sql} because PostgreSQL does not retain
- * length/precision modifiers for function parameters ({@code pg_proc} only
- * stores the base type, so {@code format_type} can never report e.g.
- * {@code character varying(128)} for an argument). Column types are read from
- * the database itself and normalized through {@code format_type}, so both
- * sides of the comparison are expressed in the same spelling.
+ * length/precision modifiers.
  */
 public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
+
+    @Inject
+    private JdbcTemplate jdbcTemplate;
 
     /**
      * Helper functions ({@code fn_db_*}) take parameters like {@code v_table}
@@ -48,7 +42,7 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
     private static final String HELPER_FUNCTION_PREFIX = "fn_db_";
 
     /**
-     * Base tables a stored procedure body touches. Views ({@code *_view}) are
+     * Base tables a stored procedure body touches. Views are
      * not part of the schema map and therefore contribute no columns.
      */
     private static final Pattern TABLE_REF_PATTERN = Pattern.compile(
@@ -56,31 +50,16 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
             Pattern.CASE_INSENSITIVE);
 
     /**
-     * Pseudotypes reported by {@code format_type} that do not correspond to
-     * any column type (e.g. the {@code record} type of OUT parameters in
-     * table-returning helpers), so they cannot be compared.
+     * Strips SQL line comments from a function body so that
+     * commented-out statements cannot inject phantom table references into
+     * the table scan.
      */
-    private static final Set<String> SKIP_TYPES = Set.of(
-            "any",
-            "anyarray",
-            "anyelement",
-            "anyenum",
-            "anynonarray",
-            "anyrange",
-            "event_trigger",
-            "internal",
-            "language_handler",
-            "opaque",
-            "record",
-            "trigger",
-            "void");
+    private static String stripLineComments(String definition) {
+        return definition.replaceAll("(?m)^.*--.*$", "");
+    }
 
     /**
-     * Directory holding the stored procedure sources. Resolved from the
-     * module's location on the classpath rather than a fixed number of
-     * {@code ..} segments, so the test works both from Maven (working
-     * directory is the dal module) and from IDEs (working directory is the
-     * project root).
+     * Resolves the directory path holding the stored procedure sources.
      */
     private static Path dbscriptsDir() {
         Path dir = Paths.get(System.getProperty("user.dir")).toAbsolutePath();
@@ -116,24 +95,29 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
 
     /**
      * Matches a single parameter declaration, e.g.
-     * {@code v_name character varying(128)}. Parameter modes ({@code in},
-     * {@code out}, {@code inout}) are not captured; {@code out}/
-     * {@code inout} parameters are filtered out later because they are not
-     * caller-supplied values.
+     * v_name character varying(128). Accepts the in/inout parameter
+     * modes; out-only parameters are not caller-supplied and are left
+     * unmatched on purpose. Leading whitespace is tolerated because the
+     * parameter list is split on commas from a multi-line signature.
+     * An optional DEFAULT clause is swallowed but not captured, so that
+     * declarations like v_timezone VARCHAR(300) DEFAULT NULL are still
+     * checked.
      */
     private static final Pattern PARAMETER_DECLARATION_PATTERN = Pattern.compile(
-            "(?i)(?:in\\s+)?(v_[a-z0-9_]+)\\s+([a-z][a-z0-9_ ]*?(?:\\([^)]*\\))?)\\s*");
+            "(?i)\\s*(?:in(?:out)?\\s+)?(v_[a-z0-9_]+)\\s+"
+            + "([a-z][a-z0-9_]*(?:\\s+(?!default\\b)[a-z][a-z0-9_]*)*(?:\\([^)]*\\))?)"
+            + "(?:\\s+default\\b.*)?"
+            + "\\s*");
 
     /**
      * Normalizes the type spellings used in the SQL sources to the spellings
-     * produced by {@code format_type}, which is how column types are reported
-     * by the database (e.g. {@code varchar} is written as
-     * {@code character varying}).
+     * produced, which is how column types are reported
+     * by the database.
      */
     private static final Map<String, String> BASE_TYPE_ALIASES = buildBaseTypeAliases();
 
     /**
-     * Width ordering within the integer family, used to tell a narrowing
+     * Ordering within the integer family, used to tell a narrowing
      * (data-loss risk) from a widening (harmless) in the failure report.
      */
     private static final Map<String, Integer> INTEGER_WIDTH = Map.of(
@@ -141,13 +125,11 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
             "integer", 2,
             "bigint", 3);
 
-    @Inject
-    private JdbcTemplate jdbcTemplate;
-
     @Test
     public void storedProcedureParameterTypesMatchColumnTypes() {
         Map<String, Map<String, String>> schema = loadColumnTypes();
         List<Mismatch> mismatches = new ArrayList<>();
+        int checkedParameters = 0;
 
         for (StoredProcedure storedProcedure : loadDeclaredProcedures()) {
             if (storedProcedure.name.startsWith(HELPER_FUNCTION_PREFIX)) {
@@ -157,25 +139,26 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
             for (Map.Entry<String, String> argument : storedProcedure.arguments.entrySet()) {
                 ColumnRef expected = resolveType(columnName(argument.getKey()), tables, schema);
                 String found = argument.getValue();
-                if (expected == null
-                        || SKIP_TYPES.contains(found)
-                        || found.equals(expected.type)) {
+                if (expected == null) {
                     continue;
                 }
-                mismatches.add(new Mismatch(storedProcedure.name,
+                checkedParameters++;
+                if (!found.equals(expected.type)) {
+                    mismatches.add(new Mismatch(storedProcedure.name,
                         argument.getKey(),
                         found,
                         expected));
+                }
             }
         }
-
+        assertTrue(checkedParameters > 0, "No parameters were checked");
         assertTrue(mismatches.isEmpty(), () -> render(mismatches));
     }
 
     /**
-     * @return all columns of all base tables in the public schema as
-     *         {@code table -> (column -> full type with length/precision
-     *         modifiers)}, as reported by {@code format_type}
+     * @return columns of base tables in the schema as
+     *         table -> column -> full type with length/precision
+     *         modifiers
      */
     private Map<String, Map<String, String>> loadColumnTypes() {
         String sql = "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod)"
@@ -196,8 +179,8 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
 
     /**
      * Parses the declared parameter types of every function in
-     * {@code packaging/dbscripts/*_sp.sql}, with their length/precision
-     * modifiers, and resolves the tables each function body touches so that
+     * stored procedures with their length/precision modifiers,
+     * and resolves the tables each function body touches so that
      * only checkable parameters are kept.
      */
     private List<StoredProcedure> loadDeclaredProcedures() {
@@ -267,10 +250,10 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
     }
 
     /**
-     * Rewrites a declared parameter type (with any length/precision modifier)
-     * into the exact spelling {@code format_type} uses for the equivalent
-     * column type, so both sides of the comparison can be compared as strings.
-     * Types without a known alias are passed through lower-cased.
+     * Rewrites a declared parameter type into the exact spelling used
+     * for the equivalent column type, so both sides of the comparison can
+     * be compared as strings. Types without a known alias are passed
+     * through lower-cased.
      */
     private static String normalizeDeclaredType(String declaredType) {
         String type = declaredType.trim().toLowerCase();
@@ -307,7 +290,7 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
     }
 
     /**
-     * Strips the conventional v_ parameter prefix.
+     * Strips the v_ parameter prefix.
      */
     private static String columnName(String parameterName) {
         String name = parameterName.toLowerCase();
@@ -316,7 +299,7 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
 
     private static Set<String> referencedTables(String definition, Set<String> knownTables) {
         Set<String> tables = new HashSet<>();
-        Matcher matcher = TABLE_REF_PATTERN.matcher(definition);
+        Matcher matcher = TABLE_REF_PATTERN.matcher(stripLineComments(definition));
         while (matcher.find()) {
             String table = matcher.group(1).toLowerCase();
             if (knownTables.contains(table)) {
