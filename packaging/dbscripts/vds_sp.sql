@@ -5,10 +5,10 @@
 -- [vds_statistics] Table
 --
 CREATE OR REPLACE FUNCTION InsertVdsStatistics (
-    v_cpu_idle DECIMAL(18, 0),
-    v_cpu_load DECIMAL(18, 0),
-    v_cpu_sys DECIMAL(18, 0),
-    v_cpu_user DECIMAL(18, 0),
+    v_cpu_idle DECIMAL(18,0),
+    v_cpu_load DECIMAL(18,0),
+    v_cpu_sys DECIMAL(18,0),
+    v_cpu_user DECIMAL(18,0),
     v_usage_cpu_percent INT,
     v_usage_mem_percent INT,
     v_usage_network_percent INT,
@@ -92,10 +92,10 @@ END;$FUNCTION$
 LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION UpdateVdsStatistics (
-    v_cpu_idle DECIMAL(18, 0),
-    v_cpu_load DECIMAL(18, 0),
-    v_cpu_sys DECIMAL(18, 0),
-    v_cpu_user DECIMAL(18, 0),
+    v_cpu_idle DECIMAL(18,0),
+    v_cpu_load DECIMAL(18,0),
+    v_cpu_sys DECIMAL(18,0),
+    v_cpu_user DECIMAL(18,0),
     v_usage_cpu_percent INT,
     v_usage_mem_percent INT,
     v_usage_network_percent INT,
@@ -203,7 +203,7 @@ CREATE OR REPLACE FUNCTION InsertVdsDynamic (
     v_cpu_cores INT,
     v_cpu_threads INT,
     v_cpu_model VARCHAR(255),
-    v_cpu_speed_mh DECIMAL(18, 0),
+    v_cpu_speed_mh DECIMAL(18,0),
     v_if_total_speed VARCHAR(40),
     v_kvm_enabled BOOLEAN,
     v_mem_commited INT,
@@ -468,7 +468,7 @@ CREATE OR REPLACE FUNCTION UpdateVdsDynamic (
     v_cpu_cores INT,
     v_cpu_threads INT,
     v_cpu_model VARCHAR(255),
-    v_cpu_speed_mh DECIMAL(18, 0),
+    v_cpu_speed_mh DECIMAL(18,0),
     v_if_total_speed VARCHAR(40),
     v_kvm_enabled BOOLEAN,
     v_mem_commited INT,
@@ -502,7 +502,7 @@ CREATE OR REPLACE FUNCTION UpdateVdsDynamic (
     v_gluster_version VARCHAR(4000),
     v_librbd1_version VARCHAR(4000),
     v_glusterfs_cli_version VARCHAR(4000),
-    v_openvswitch_version VARCHAR(40000),
+    v_openvswitch_version VARCHAR(4000),
     v_kernel_version VARCHAR(4000),
     v_nmstate_version VARCHAR(4000),
     v_iscsi_initiator_name VARCHAR(4000),
@@ -1590,9 +1590,9 @@ END;$FUNCTION$
 LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION CheckIfExistsHostThatMissesNetworkInCluster(
-    v_cluster_id   UUID,
-    v_network_name VARCHAR(50),
-    v_host_status  INT
+    v_cluster_id UUID,
+    v_network_name VARCHAR(256),
+    v_host_status INT
     )
 RETURNS BOOLEAN STABLE AS $FUNCTION$
 BEGIN

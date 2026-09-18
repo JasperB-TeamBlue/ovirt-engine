@@ -15,7 +15,7 @@ CREATE OR REPLACE FUNCTION InsertGlusterGeoRepSession (
     v_slave_host_uuid UUID,
     v_slave_volume_name VARCHAR(50),
     v_slave_volume_id UUID,
-    v_status VARCHAR(50),
+    v_status VARCHAR,
     v_user_name VARCHAR(255)
     )
 RETURNS VOID AS $FUNCTION$
@@ -126,7 +126,7 @@ CREATE OR REPLACE FUNCTION UpdateGlusterGeoRepSessionDetail (
     v_master_brick_id UUID,
     v_slave_host_name VARCHAR(50),
     v_slave_host_uuid UUID,
-    v_status VARCHAR(20),
+    v_status VARCHAR,
     v_checkpoint_status VARCHAR(20),
     v_crawl_status VARCHAR(20),
     v_data_pending BIGINT,

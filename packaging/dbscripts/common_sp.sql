@@ -511,7 +511,7 @@ LANGUAGE plpgsql;
         OR REPLACE FUNCTION attach_user_to_role (
         v_user_name VARCHAR(255),
         v_domain VARCHAR(255),
-        v_namespace VARCHAR(255),
+        v_namespace VARCHAR(2048),
         v_domain_entry_id TEXT,
         v_role_name VARCHAR(255)
         )

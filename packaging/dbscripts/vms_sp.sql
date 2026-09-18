@@ -156,9 +156,9 @@ LANGUAGE plpgsql;
 -- [vm_statistics] Table
 --
 CREATE OR REPLACE FUNCTION InsertVmStatistics (
-    v_cpu_sys DECIMAL(18, 0),
-    v_cpu_user DECIMAL(18, 0),
-    v_elapsed_time DECIMAL(18, 0),
+    v_cpu_sys DECIMAL(18,0),
+    v_cpu_user DECIMAL(18,0),
+    v_elapsed_time DECIMAL(18,0),
     v_usage_cpu_percent INT,
     v_usage_mem_percent INT,
     v_usage_network_percent SMALLINT,
@@ -197,9 +197,9 @@ END;$FUNCTION$
 LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION UpdateVmStatistics (
-    v_cpu_sys DECIMAL(18, 0),
-    v_cpu_user DECIMAL(18, 0),
-    v_elapsed_time DECIMAL(18, 0),
+    v_cpu_sys DECIMAL(18,0),
+    v_cpu_user DECIMAL(18,0),
+    v_elapsed_time DECIMAL(18,0),
     v_usage_cpu_percent INT,
     v_usage_mem_percent INT,
     v_usage_network_percent SMALLINT,
@@ -300,7 +300,7 @@ CREATE OR REPLACE FUNCTION InsertVmDynamic (
     v_last_watchdog_action VARCHAR(8),
     v_is_run_once BOOLEAN,
     v_volatile_run BOOLEAN,
-    v_cpu_name VARCHAR(255),
+    v_cpu_name VARCHAR(4000),
     v_emulated_machine VARCHAR(255),
     v_current_cd VARCHAR(4000),
     v_exit_reason INT,
@@ -482,7 +482,7 @@ CREATE OR REPLACE FUNCTION UpdateVmDynamic (
     v_last_watchdog_action VARCHAR(8),
     v_is_run_once BOOLEAN,
     v_volatile_run BOOLEAN,
-    v_cpu_name VARCHAR(255),
+    v_cpu_name VARCHAR(4000),
     v_emulated_machine VARCHAR(255),
     v_current_cd VARCHAR(4000),
     v_reason TEXT,

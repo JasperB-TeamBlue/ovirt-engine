@@ -1214,7 +1214,7 @@ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION Getstorage_domains_By_storage_pool_id_and_connection (
     v_storage_pool_id UUID,
-    v_connection VARCHAR
+    v_connection VARCHAR(250)
     )
 RETURNS SETOF storage_domains STABLE AS $FUNCTION$
 BEGIN
