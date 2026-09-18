@@ -2,6 +2,12 @@ package org.ovirt.engine.core.dao;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -11,6 +17,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import javax.inject.Inject;
 
@@ -18,7 +25,18 @@ import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
- * Guards against inconsistencies between the parameters that are used in stored procedures and the columns of the tables they reference.
+ * Guards against inconsistencies between the parameters that are used in
+ * stored procedures and the columns of the tables they reference, including
+ * length/precision modifiers (a {@code varchar(100)} parameter against a
+ * {@code varchar(255)} column is a mismatch).
+ *
+ * Parameter declarations are parsed from the source files under
+ * {@code packaging/dbscripts/*_sp.sql} because PostgreSQL does not retain
+ * length/precision modifiers for function parameters ({@code pg_proc} only
+ * stores the base type, so {@code format_type} can never report e.g.
+ * {@code character varying(128)} for an argument). Column types are read from
+ * the database itself and normalized through {@code format_type}, so both
+ * sides of the comparison are expressed in the same spelling.
  */
 public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
 
@@ -38,21 +56,90 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
             Pattern.CASE_INSENSITIVE);
 
     /**
-     * Maps every sql type spelling used in the engine schema (both the
-     * {@code information_schema} spellings of the column types and the
-     * {@code format_type} spellings of the procedure parameters) to a single
-     * canonical name. Length/precision modifiers are ignored because it does not affect assignment compatibility.
+     * Pseudotypes reported by {@code format_type} that do not correspond to
+     * any column type (e.g. the {@code record} type of OUT parameters in
+     * table-returning helpers), so they cannot be compared.
      */
-    private static final Map<String, String> CANONICAL_TYPES = buildCanonicalTypes();
+    private static final Set<String> SKIP_TYPES = Set.of(
+            "any",
+            "anyarray",
+            "anyelement",
+            "anyenum",
+            "anynonarray",
+            "anyrange",
+            "event_trigger",
+            "internal",
+            "language_handler",
+            "opaque",
+            "record",
+            "trigger",
+            "void");
+
+    /**
+     * Directory holding the stored procedure sources. Resolved from the
+     * module's location on the classpath rather than a fixed number of
+     * {@code ..} segments, so the test works both from Maven (working
+     * directory is the dal module) and from IDEs (working directory is the
+     * project root).
+     */
+    private static Path dbscriptsDir() {
+        Path dir = Paths.get(System.getProperty("user.dir")).toAbsolutePath();
+        while (dir != null && !Files.isDirectory(dir.resolve("packaging/dbscripts"))) {
+            dir = dir.getParent();
+        }
+        if (dir == null) {
+            throw new IllegalStateException(
+                    "Cannot locate packaging/dbscripts above " + System.getProperty("user.dir"));
+        }
+        return dir.resolve("packaging/dbscripts");
+    }
+
+    /**
+     * Matches a complete {@code CREATE OR REPLACE FUNCTION} declaration with a
+     * dollar-quoted body: group 1 is the function name, group 2 the parameter
+     * list, group 3 the dollar-quote tag and group 4 the function body. The
+     * parameter-list pattern allows one level of nested parentheses so that
+     * modifiers such as {@code numeric(18,9)} do not terminate the list.
+     */
+    private static final Pattern FUNCTION_PATTERN = Pattern.compile(
+            "(?is)\\bcreate\\s+(?:or\\s+replace\\s+)?function\\s+"
+            + "([a-z][a-z0-9_]*)\\s*"
+            + "\\(([^)]*(?:\\([^)]*\\)[^)]*)*)\\)\\s*"
+            + "(?:returns\\s+[^$]*?)?\\s*as\\s*"
+            + "(\\$[a-z0-9_]*\\$)(.*?)\\3");
+
+    /**
+     * Matches a trailing length/precision modifier, e.g. the {@code (18,9)} of
+     * {@code numeric(18,9)}.
+     */
+    private static final Pattern MODIFIER_AT_END = Pattern.compile("\\(([^)]*)\\)$");
+
+    /**
+     * Matches a single parameter declaration, e.g.
+     * {@code v_name character varying(128)}. Parameter modes ({@code in},
+     * {@code out}, {@code inout}) are not captured; {@code out}/
+     * {@code inout} parameters are filtered out later because they are not
+     * caller-supplied values.
+     */
+    private static final Pattern PARAMETER_DECLARATION_PATTERN = Pattern.compile(
+            "(?i)(?:in\\s+)?(v_[a-z0-9_]+)\\s+([a-z][a-z0-9_ ]*?(?:\\([^)]*\\))?)\\s*");
+
+    /**
+     * Normalizes the type spellings used in the SQL sources to the spellings
+     * produced by {@code format_type}, which is how column types are reported
+     * by the database (e.g. {@code varchar} is written as
+     * {@code character varying}).
+     */
+    private static final Map<String, String> BASE_TYPE_ALIASES = buildBaseTypeAliases();
 
     /**
      * Width ordering within the integer family, used to tell a narrowing
      * (data-loss risk) from a widening (harmless) in the failure report.
      */
     private static final Map<String, Integer> INTEGER_WIDTH = Map.of(
-            "SMALLINT", 1,
-            "INTEGER", 2,
-            "BIGINT", 3);
+            "smallint", 1,
+            "integer", 2,
+            "bigint", 3);
 
     @Inject
     private JdbcTemplate jdbcTemplate;
@@ -62,15 +149,17 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
         Map<String, Map<String, String>> schema = loadColumnTypes();
         List<Mismatch> mismatches = new ArrayList<>();
 
-        for (StoredProcedure storedProcedure : loadStoredProcedures()) {
+        for (StoredProcedure storedProcedure : loadDeclaredProcedures()) {
             if (storedProcedure.name.startsWith(HELPER_FUNCTION_PREFIX)) {
                 continue;
             }
             Set<String> tables = referencedTables(storedProcedure.definition, schema.keySet());
             for (Map.Entry<String, String> argument : storedProcedure.arguments.entrySet()) {
                 ColumnRef expected = resolveType(columnName(argument.getKey()), tables, schema);
-                String found = canonicalType(argument.getValue());
-                if (expected == null || found == null || found.equals(expected.type)) {
+                String found = argument.getValue();
+                if (expected == null
+                        || SKIP_TYPES.contains(found)
+                        || found.equals(expected.type)) {
                     continue;
                 }
                 mismatches.add(new Mismatch(storedProcedure.name,
@@ -84,54 +173,137 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
     }
 
     /**
-     * @return all columns of all base tables in the public schema as {@code table -> (column -> canonical type)}
+     * @return all columns of all base tables in the public schema as
+     *         {@code table -> (column -> full type with length/precision
+     *         modifiers)}, as reported by {@code format_type}
      */
     private Map<String, Map<String, String>> loadColumnTypes() {
-        String sql = "SELECT c.table_name, c.column_name, c.data_type"
-                + " FROM information_schema.columns c"
-                + " JOIN information_schema.tables t"
-                + "   ON t.table_schema = c.table_schema AND t.table_name = c.table_name"
-                + " WHERE c.table_schema = 'public'"
-                + "   AND t.table_type = 'BASE TABLE'";
+        String sql = "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod)"
+                + " FROM pg_attribute a"
+                + " JOIN pg_class c ON c.oid = a.attrelid"
+                + " WHERE c.relnamespace = 'public'::regnamespace"
+                + "   AND c.relkind = 'r'"
+                + "   AND a.attnum > 0"
+                + "   AND NOT a.attisdropped";
         Map<String, Map<String, String>> schema = new HashMap<>();
         jdbcTemplate.query(sql, rs -> {
-            String type = canonicalType(rs.getString(3));
-            if (type != null) {
-                schema.computeIfAbsent(rs.getString(1).toLowerCase(),
-                        table -> new HashMap<>())
-                        .put(rs.getString(2).toLowerCase(), type);
-            }
+            schema.computeIfAbsent(rs.getString(1).toLowerCase(),
+                    table -> new HashMap<>())
+                    .put(rs.getString(2).toLowerCase(), rs.getString(3));
         });
         return schema;
     }
 
     /**
-     * @return all stored functions of the public schema with their declared
-     *         parameters, as reported by the database
+     * Parses the declared parameter types of every function in
+     * {@code packaging/dbscripts/*_sp.sql}, with their length/precision
+     * modifiers, and resolves the tables each function body touches so that
+     * only checkable parameters are kept.
      */
-    private List<StoredProcedure> loadStoredProcedures() {
-        String sql = "SELECT p.oid,"
-                + " p.proname,"
-                + " u.argname,"
-                + " format_type(u.argtype, NULL),"
-                + " pg_get_functiondef(p.oid)"
-                + " FROM pg_proc p"
-                + " CROSS JOIN LATERAL unnest("
-                + "        coalesce(p.proallargtypes, p.proargtypes::oid[]),"
-                + "        coalesce(p.proargnames, '{}')) AS u(argtype, argname)"
-                + " WHERE p.pronamespace = 'public'::regnamespace"
-                + "   AND p.prokind = 'f'"
-                + "   AND u.argname IS NOT NULL"
-                + "   AND u.argtype IS NOT NULL";
-        Map<Long, StoredProcedure> storedProcedures = new LinkedHashMap<>();
-        jdbcTemplate.query(sql, rs -> {
-            String name = rs.getString(2);
-            String definition = rs.getString(5);
-            storedProcedures.computeIfAbsent(rs.getLong(1),
-                    id -> new StoredProcedure(name, definition))
-                    .addArgument(rs.getString(3), rs.getString(4));
-        });
-        return new ArrayList<>(storedProcedures.values());
+    private List<StoredProcedure> loadDeclaredProcedures() {
+        Path dbscriptsDir = dbscriptsDir();
+        List<StoredProcedure> storedProcedures = new ArrayList<>();
+        try (Stream<Path> files = Files.list(dbscriptsDir)) {
+            files.filter(p -> p.getFileName().toString().endsWith("_sp.sql"))
+                    .sorted()
+                    .forEach(file -> parseFile(file, storedProcedures));
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot read " + dbscriptsDir, e);
+        }
+        return storedProcedures;
+    }
+
+    private void parseFile(Path file, List<StoredProcedure> storedProcedures) {
+        String content;
+        try {
+            content = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot read " + file, e);
+        }
+        Matcher functions = FUNCTION_PATTERN.matcher(content);
+        while (functions.find()) {
+            String name = functions.group(1);
+            String body = functions.group(4);
+            StoredProcedure storedProcedure =
+                    new StoredProcedure(name, body);
+            for (String declaration : splitParameterList(functions.group(2))) {
+                Matcher parameter = PARAMETER_DECLARATION_PATTERN.matcher(declaration);
+                if (parameter.matches()) {
+                    storedProcedure.addArgument(
+                            parameter.group(1),
+                            normalizeDeclaredType(parameter.group(2)));
+                }
+            }
+            if (!storedProcedure.arguments.isEmpty()) {
+                storedProcedures.add(storedProcedure);
+            }
+        }
+    }
+
+    /**
+     * Splits a parameter list on commas that are not inside parentheses, so
+     * that modifiers like {@code numeric(18,9)} survive as one declaration.
+     */
+    private static List<String> splitParameterList(String parameterList) {
+        List<String> declarations = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        int depth = 0;
+        for (char c : parameterList.toCharArray()) {
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            } else if (c == ',' && depth == 0) {
+                declarations.add(current.toString());
+                current.setLength(0);
+                continue;
+            }
+            current.append(c);
+        }
+        if (current.length() > 0) {
+            declarations.add(current.toString());
+        }
+        return declarations;
+    }
+
+    /**
+     * Rewrites a declared parameter type (with any length/precision modifier)
+     * into the exact spelling {@code format_type} uses for the equivalent
+     * column type, so both sides of the comparison can be compared as strings.
+     * Types without a known alias are passed through lower-cased.
+     */
+    private static String normalizeDeclaredType(String declaredType) {
+        String type = declaredType.trim().toLowerCase();
+        String base = MODIFIER_AT_END.matcher(type).replaceFirst("").trim();
+        String modifier = type.equals(base) ? "" : type.substring(base.length());
+        String canonicalBase = BASE_TYPE_ALIASES.getOrDefault(base, base);
+        return canonicalBase + modifier;
+    }
+
+    private static Map<String, String> buildBaseTypeAliases() {
+        Map<String, String> aliases = new HashMap<>();
+        // character family
+        aliases.put("character varying", "character varying");
+        aliases.put("varchar", "character varying");
+        aliases.put("character", "character");
+        aliases.put("char", "character");
+        aliases.put("bpchar", "character");
+        // integer family
+        aliases.put("smallint", "smallint");
+        aliases.put("int2", "smallint");
+        aliases.put("integer", "integer");
+        aliases.put("int", "integer");
+        aliases.put("int4", "integer");
+        aliases.put("bigint", "bigint");
+        aliases.put("int8", "bigint");
+        // numeric / float family
+        aliases.put("numeric", "numeric");
+        aliases.put("decimal", "numeric");
+        aliases.put("real", "real");
+        aliases.put("float4", "real");
+        aliases.put("double precision", "double precision");
+        aliases.put("float8", "double precision");
+        return aliases;
     }
 
     /**
@@ -179,19 +351,6 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
         return result;
     }
 
-    /**
-     * Canonical type name for a column/parameter type spec, or null
-     * when the type is outside the families this test understands.
-     * Ignores length/precision modifiers.
-     */
-    private static String canonicalType(String typeSpec) {
-        String type = typeSpec.replaceAll("\\([^)]*\\)", " ")
-                .toLowerCase()
-                .trim()
-                .replaceAll("\\s+", " ");
-        return CANONICAL_TYPES.get(type);
-    }
-
     private static String classify(String found, String expected) {
         Integer foundWidth = INTEGER_WIDTH.get(found);
         Integer expectedWidth = INTEGER_WIDTH.get(expected);
@@ -217,51 +376,6 @@ public class DbTypeConsistencyTest extends BaseDaoTestCase<TagDao> {
         message.append("\nUpdate the parameter declarations in packaging/dbscripts/*_sp.sql")
                 .append(" to match the column types.\n");
         return message.toString();
-    }
-
-    private static Map<String, String> buildCanonicalTypes() {
-        Map<String, String> types = new HashMap<>();
-        // integer family
-        types.put("smallint", "SMALLINT");
-        types.put("int2", "SMALLINT");
-        types.put("integer", "INTEGER");
-        types.put("int", "INTEGER");
-        types.put("int4", "INTEGER");
-        types.put("bigint", "BIGINT");
-        types.put("int8", "BIGINT");
-        // boolean
-        types.put("boolean", "BOOLEAN");
-        types.put("bool", "BOOLEAN");
-        // exact / floating-point numeric
-        types.put("numeric", "NUMERIC");
-        types.put("decimal", "NUMERIC");
-        types.put("real", "REAL");
-        types.put("float4", "REAL");
-        types.put("double precision", "DOUBLE PRECISION");
-        types.put("float8", "DOUBLE PRECISION");
-        // character / text
-        types.put("character varying", "VARCHAR");
-        types.put("varchar", "VARCHAR");
-        types.put("character", "CHAR");
-        types.put("char", "CHAR");
-        types.put("bpchar", "CHAR");
-        types.put("text", "TEXT");
-        // uuid
-        types.put("uuid", "UUID");
-        // date / time
-        types.put("timestamp with time zone", "TIMESTAMPTZ");
-        types.put("timestamptz", "TIMESTAMPTZ");
-        types.put("timestamp without time zone", "TIMESTAMP");
-        types.put("timestamp", "TIMESTAMP");
-        types.put("date", "DATE");
-        types.put("time without time zone", "TIME");
-        types.put("time", "TIME");
-        types.put("time with time zone", "TIMETZ");
-        // binary / json
-        types.put("jsonb", "JSONB");
-        types.put("json", "JSON");
-        types.put("bytea", "BYTEA");
-        return types;
     }
 
     private static final class StoredProcedure {
